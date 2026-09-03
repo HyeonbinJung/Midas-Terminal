@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: midas-capital-research-terminal
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SEC_USER_AGENT
+        sync: false
