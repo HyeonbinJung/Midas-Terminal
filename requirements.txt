@@ -9,3 +9,5 @@ aiohttp>=3.10,<4.0
 python-dotenv>=1.0,<2.0
 
 googletrans==4.0.2
+
+exchange-calendars>=4.11,<5.0

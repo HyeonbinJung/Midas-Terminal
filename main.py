@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -37,12 +38,26 @@ from services.research_engine import (  # noqa: E402
     build_highlights,
     build_risk_factors,
     build_key_financials_payload,
+    build_peer_analysis_payload,
     build_filled_template_from_components,
     fetch_market_data,
     fetch_sec_research,
     select_peer_companies,
 )
 from services.translation import translate_research_components_to_korean  # noqa: E402
+from services.stock_screener import screen_stocks  # noqa: E402
+from services.alpha_factors import FACTOR_CATALOG, build_alpha_factor_payload  # noqa: E402
+from services.portfolio import (  # noqa: E402
+    cancel_order,
+    fetch_chart_data,
+    fetch_yfinance_quote,
+    get_portfolio_payload,
+    init_portfolio_db,
+    market_status as portfolio_market_status,
+    quote_payload,
+    submit_order,
+    process_open_orders,
+)
 
 STATIC_DIR = BASE_DIR / "static"
 GENERATED_DIR = BASE_DIR / "generated"
@@ -169,12 +184,33 @@ sec_cache: AsyncTTLCache[SecResearch] = AsyncTTLCache(max_items=256)
 peer_cache: AsyncTTLCache[list[MarketData]] = AsyncTTLCache(max_items=256)
 news_cache: AsyncTTLCache[dict[str, Any]] = AsyncTTLCache(max_items=8)
 translation_cache: AsyncTTLCache[TranslatedResearch] = AsyncTTLCache(max_items=128)
+alpha_factor_cache: AsyncTTLCache[dict[str, Any]] = AsyncTTLCache(max_items=128)
+peer_analysis_cache: AsyncTTLCache[dict[str, Any]] = AsyncTTLCache(max_items=128)
 rate_limiter = SlidingWindowLimiter()
 report_semaphore = asyncio.Semaphore(REPORT_CONCURRENCY)
 yahoo_semaphore = asyncio.Semaphore(YAHOO_CONCURRENCY)
 report_ticker_locks: dict[str, asyncio.Lock] = {}
 
-app = FastAPI(title="Midas Capital Research Terminal", version="5.1.0")
+app = FastAPI(title="Midas Capital Research Terminal", version="5.11.0")
+portfolio_order_monitor_task: asyncio.Task | None = None
+
+
+class PortfolioTradeRequest(BaseModel):
+    side: str = Field(min_length=3, max_length=4)
+    ticker: str = Field(min_length=1, max_length=15)
+    quantity: float = Field(gt=0)
+    password: str = Field(min_length=1, max_length=64)
+    order_type: str = Field(default="MARKET", min_length=5, max_length=6)
+    limit_price: float | None = Field(default=None, gt=0)
+    tif: str = Field(default="DAY", min_length=3, max_length=3)
+    note: str = Field(default="", max_length=240)
+
+
+class PortfolioCancelRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=64)
+
+
+init_portfolio_db()
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -439,9 +475,37 @@ def _cleanup_stale_generated() -> None:
             continue
 
 
+async def _portfolio_order_monitor() -> None:
+    # Best-effort background processing for authorized open LIMIT orders.
+    # SQLite transactions prevent balance corruption; the service is intended
+    # for the default single-worker deployment used by this terminal.
+    while True:
+        try:
+            await asyncio.to_thread(process_open_orders)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[PORTFOLIO] order monitor: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(15)
+
+
 @app.on_event("startup")
 async def startup_cleanup() -> None:
+    global portfolio_order_monitor_task
     await asyncio.to_thread(_cleanup_stale_generated)
+    portfolio_order_monitor_task = asyncio.create_task(_portfolio_order_monitor())
+
+
+@app.on_event("shutdown")
+async def shutdown_portfolio_monitor() -> None:
+    global portfolio_order_monitor_task
+    if portfolio_order_monitor_task is not None:
+        portfolio_order_monitor_task.cancel()
+        try:
+            await portfolio_order_monitor_task
+        except asyncio.CancelledError:
+            pass
+        portfolio_order_monitor_task = None
 
 
 @app.middleware("http")
@@ -475,7 +539,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "Midas Capital Research Terminal",
-        "version": "5.1.0",
+        "version": "5.9.0",
         "report_concurrency": REPORT_CONCURRENCY,
         "yahoo_concurrency": YAHOO_CONCURRENCY,
     }
@@ -491,6 +555,205 @@ async def market(ticker: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=504, detail="Market-data request timed out.") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/screener")
+async def screener(
+    request: Request,
+    market_cap: str = "Any",
+    sector: str = "Any",
+    volatility: str = "Any",
+    beta: str = "Any",
+    style: str = "Any",
+    growth: str = "Any",
+    profitability: str = "Any",
+    leverage: str = "Any",
+    cash_flow: str = "Any",
+    dividend: str = "Any",
+    momentum: str = "Any",
+    liquidity: str = "Any",
+    cyclicality: str = "Any",
+) -> dict[str, Any]:
+    _enforce_rate_limit(request, "screener", limit=8, window_seconds=60)
+    filters = {
+        "market_cap": market_cap, "sector": sector, "volatility": volatility,
+        "beta": beta, "style": style, "growth": growth,
+        "profitability": profitability, "leverage": leverage,
+        "cash_flow": cash_flow, "dividend": dividend, "momentum": momentum,
+        "liquidity": liquidity, "cyclicality": cyclicality,
+    }
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(screen_stocks, filters, 5), timeout=75)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Stock screener timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/alpha-factor-catalog")
+async def alpha_factor_catalog() -> dict[str, Any]:
+    return {"catalog": FACTOR_CATALOG}
+
+
+@app.get("/api/alpha-factors/{ticker}")
+async def alpha_factors(ticker: str, request: Request) -> dict[str, Any]:
+    _enforce_rate_limit(request, "alpha-factors", limit=20, window_seconds=60)
+    symbol = ticker.upper().strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Ticker is required.")
+
+    async def factory() -> dict[str, Any]:
+        return await asyncio.wait_for(
+            asyncio.to_thread(build_alpha_factor_payload, symbol),
+            timeout=90,
+        )
+
+    try:
+        value, _ = await alpha_factor_cache.get_or_create(symbol + ":ALPHA:V2", 300, factory)
+        return value
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Alpha-factor request timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/peer-analysis/{ticker}")
+async def peer_analysis(ticker: str, request: Request, peers: str = "") -> dict[str, Any]:
+    _enforce_rate_limit(request, "peer-analysis", limit=12, window_seconds=60)
+    subject = ticker.upper().strip()
+    raw_peers = [item.strip().upper() for item in peers.replace(";", ",").split(",") if item.strip()]
+    # Preserve analyst order while removing duplicates and the subject security.
+    peer_symbols: list[str] = []
+    for symbol in raw_peers:
+        if symbol != subject and symbol not in peer_symbols:
+            peer_symbols.append(symbol)
+    if len(peer_symbols) > 7:
+        raise HTTPException(status_code=400, detail="A maximum of 7 peers can be compared.")
+    symbols = [subject] + peer_symbols
+    if not subject:
+        raise HTTPException(status_code=400, detail="Subject ticker is required.")
+    cache_key = ":PEERANALYSIS:V1:" + "|".join(symbols)
+
+    async def factory() -> dict[str, Any]:
+        results = await asyncio.gather(*[_get_market_data(symbol) for symbol in symbols], return_exceptions=True)
+        companies: list[MarketData] = []
+        warnings: list[str] = []
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                if symbol == subject:
+                    raise result
+                warnings.append(f"{symbol}: {type(result).__name__} — {result}")
+            else:
+                companies.append(result)
+        payload = build_peer_analysis_payload(companies)
+        payload["requested"] = symbols
+        payload["warnings"] = warnings
+        return payload
+
+    try:
+        value, _ = await peer_analysis_cache.get_or_create(cache_key, 300, factory)
+        return value
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Peer-analysis request timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/portfolio")
+async def portfolio_snapshot(request: Request, refresh: bool = True) -> dict[str, Any]:
+    _enforce_rate_limit(request, "portfolio", limit=30, window_seconds=60)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(get_portfolio_payload, refresh_quotes=bool(refresh)),
+            timeout=75,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Portfolio quote refresh timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/portfolio/market-status")
+async def portfolio_market_status_api() -> dict[str, Any]:
+    return portfolio_market_status()
+
+
+@app.get("/api/portfolio/quote/{ticker}")
+async def portfolio_quote(ticker: str, request: Request) -> dict[str, Any]:
+    _enforce_rate_limit(request, "portfolio-quote", limit=30, window_seconds=60)
+    try:
+        quote = await asyncio.wait_for(asyncio.to_thread(fetch_yfinance_quote, ticker), timeout=25)
+        payload = quote_payload(quote)
+        payload["market_status"] = portfolio_market_status()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Quote request timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/portfolio/trade")
+async def portfolio_trade(order: PortfolioTradeRequest, request: Request) -> dict[str, Any]:
+    _enforce_rate_limit(request, "portfolio-trade", limit=20, window_seconds=60)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                submit_order,
+                side=order.side,
+                ticker=order.ticker,
+                quantity=order.quantity,
+                password=order.password,
+                order_type=order.order_type,
+                limit_price=order.limit_price,
+                tif=order.tif,
+                note=order.note,
+            ),
+            timeout=35,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Trade quote timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/portfolio/order/{order_id}/cancel")
+async def portfolio_cancel_order(order_id: int, body: PortfolioCancelRequest, request: Request) -> dict[str, Any]:
+    _enforce_rate_limit(request, "portfolio-cancel", limit=30, window_seconds=60)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(cancel_order, order_id=order_id, password=body.password),
+            timeout=15,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/portfolio/chart/{ticker}")
+async def portfolio_chart(ticker: str, request: Request, interval: str = "1m") -> dict[str, Any]:
+    _enforce_rate_limit(request, "portfolio-chart", limit=45, window_seconds=60)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fetch_chart_data, ticker, interval),
+            timeout=35,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Chart request timed out while waiting for Yahoo Finance.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/research/{ticker}")
